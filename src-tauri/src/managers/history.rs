@@ -39,6 +39,10 @@ static MIGRATIONS: &[M] = &[
 /// [`HistoryManager::apply_migrations`].
 const ADDED_COLUMNS: &[&str] = &["source_name", "language", "language_source"];
 
+/// How long a failed dictation outlives the history limit, so there is time
+/// to save it or transcribe it again.
+const FAILED_ENTRY_GRACE_SECS: i64 = 10 * 60;
+
 /// Every column a [`HistoryEntry`] is read from.
 const ENTRY_COLUMNS: &str = "id, file_name, timestamp, saved, title, transcription_text, \
     post_processed_text, post_process_prompt, post_process_requested, source_name, language, \
@@ -484,32 +488,51 @@ impl HistoryManager {
 
     fn cleanup_by_count(&self, limit: usize) -> Result<()> {
         let conn = self.get_connection()?;
+        let entries_to_delete =
+            Self::entries_over_limit_with_conn(&conn, limit, Utc::now().timestamp())?;
+        let deleted_count = self.delete_entries_and_files(&entries_to_delete)?;
 
-        // Unsaved dictations, newest first. Transcribed files are only ever
-        // deleted explicitly, and don't count toward the limit.
+        if deleted_count > 0 {
+            debug!("Cleaned up {} old history entries by count", deleted_count);
+        }
+
+        Ok(())
+    }
+
+    /// The unsaved dictations past the newest `limit`, except failed ones
+    /// younger than [`FAILED_ENTRY_GRACE_SECS`]. Transcribed files are only
+    /// ever deleted explicitly, and don't count toward the limit.
+    fn entries_over_limit_with_conn(
+        conn: &Connection,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 AND source_name IS NULL ORDER BY timestamp DESC"
+            "SELECT id, file_name, timestamp, transcription_text FROM transcription_history WHERE saved = 0 AND source_name IS NULL ORDER BY timestamp DESC"
         )?;
 
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
+            Ok((
+                row.get::<_, i64>("id")?,
+                row.get::<_, String>("file_name")?,
+                row.get::<_, i64>("timestamp")?,
+                row.get::<_, String>("transcription_text")?,
+            ))
         })?;
 
-        let mut entries: Vec<(i64, String)> = Vec::new();
+        let mut entries = Vec::new();
         for row in rows {
             entries.push(row?);
         }
 
-        if entries.len() > limit {
-            let entries_to_delete = &entries[limit..];
-            let deleted_count = self.delete_entries_and_files(entries_to_delete)?;
-
-            if deleted_count > 0 {
-                debug!("Cleaned up {} old history entries by count", deleted_count);
-            }
-        }
-
-        Ok(())
+        Ok(entries
+            .into_iter()
+            .skip(limit)
+            .filter(|(_, _, timestamp, text)| {
+                !text.is_empty() || now - timestamp >= FAILED_ENTRY_GRACE_SECS
+            })
+            .map(|(id, file_name, _, _)| (id, file_name))
+            .collect())
     }
 
     fn cleanup_by_time(
@@ -894,5 +917,31 @@ mod tests {
             .expect("completed entry exists");
 
         assert_eq!(entry.transcription_text, "dictated");
+    }
+
+    #[test]
+    fn count_cleanup_keeps_recent_failed_dictations() {
+        let conn = setup_conn();
+        let now = 100_000;
+        let expired = now - FAILED_ENTRY_GRACE_SECS;
+        insert_entry(&conn, now - 1, "newest", None);
+        insert_entry(&conn, now - 2, "kept by the limit", None);
+        insert_entry(&conn, now - 3, "", None);
+        insert_entry(&conn, now - 4, "over the limit", None);
+        insert_entry(&conn, expired, "", None);
+
+        let deleted: Vec<String> = HistoryManager::entries_over_limit_with_conn(&conn, 2, now)
+            .expect("find entries over the limit")
+            .into_iter()
+            .map(|(_, file_name)| file_name)
+            .collect();
+
+        assert_eq!(
+            deleted,
+            [
+                format!("handy-{}.wav", now - 4),
+                format!("handy-{}.wav", expired)
+            ]
+        );
     }
 }
