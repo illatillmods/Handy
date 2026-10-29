@@ -38,7 +38,9 @@ export const useTranscriptionJobsStore = create<TranscriptionJobsStore>()(
         });
         if (status.state === "failed") {
           console.error(`Transcription of entry ${entryId} failed:`, status);
-          toast.error(i18n.t("settings.history.transcribeFailed"));
+          toast.error(i18n.t("settings.history.transcribeFailed"), {
+            description: status.error,
+          });
         }
       });
     },
