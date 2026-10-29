@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use transcribe_cpp::{
-    Backend, BackendMask, DeviceType, Feature, Model, ModelOptions, Session, Stream,
+    Backend, BackendMask, DeviceType, ErrorKind, Feature, Model, ModelOptions, Session, Stream,
 };
 
 /// Prefix on worker log lines so the parent can tell them apart from raw
@@ -114,9 +114,16 @@ pub fn run() -> i32 {
             }
             Request::Run { options } => match session.as_mut() {
                 Some((session, info)) => {
-                    inject_fault("run", info.on_gpu);
-                    match session.run(&pcm, &options) {
+                    let result = if inject_fault("run", info.on_gpu) {
+                        Err(transcribe_cpp::Error::OutOfMemory("injected".to_string()))
+                    } else {
+                        session.run(&pcm, &options)
+                    };
+                    match result {
                         Ok(transcript) => Response::Transcript(transcript),
+                        Err(e) if e.kind() == ErrorKind::OutOfMemory => {
+                            Response::OutOfMemory(e.to_string())
+                        }
                         Err(e) => Response::Error(e.to_string()),
                     }
                 }
@@ -320,26 +327,27 @@ fn load(
 }
 
 /// Debug-build fault injection for exercising crash/hang recovery:
-/// `HANDY_WORKER_FAULT=<abort|segv|hang>@<init|list|load|run|feed|finalize>`
-/// (`abort` is what `GGML_ASSERT` ends in, `segv` a real invalid memory write)
+/// `HANDY_WORKER_FAULT=<abort|segv|hang|oom>@<init|list|load|run|feed|finalize>`
+/// (`abort` is what `GGML_ASSERT` ends in, `segv` a real invalid memory write,
+/// `oom` a run that runs out of memory: true is returned and only a run uses it)
 /// (`init` is backend registration, before the hello). With `HANDY_WORKER_FAULT_ONCE=<marker
 /// path>` it fires only in the first worker to reach that stage (the marker
 /// file records that it fired). With `HANDY_WORKER_FAULT_GPU_ONLY=1` it fires
 /// only on a GPU (backend init and device listing count as GPU work unless
 /// the worker is CPU-only), so recovery on CPU can succeed.
 #[cfg(debug_assertions)]
-fn inject_fault(stage: &str, on_gpu: bool) {
+fn inject_fault(stage: &str, on_gpu: bool) -> bool {
     let Ok(spec) = std::env::var("HANDY_WORKER_FAULT") else {
-        return;
+        return false;
     };
     let Some((kind, at)) = spec.split_once('@') else {
-        return;
+        return false;
     };
     if at != stage {
-        return;
+        return false;
     }
     if !on_gpu && std::env::var_os("HANDY_WORKER_FAULT_GPU_ONLY").is_some() {
-        return;
+        return false;
     }
     if let Some(marker) = std::env::var_os("HANDY_WORKER_FAULT_ONCE") {
         if std::fs::OpenOptions::new()
@@ -348,7 +356,7 @@ fn inject_fault(stage: &str, on_gpu: bool) {
             .open(&marker)
             .is_err()
         {
-            return;
+            return false;
         }
     }
     eprintln!("injected fault: {kind} at {stage}");
@@ -367,12 +375,16 @@ fn inject_fault(stage: &str, on_gpu: bool) {
         "hang" => loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         },
+        "oom" => return true,
         _ => {}
     }
+    false
 }
 
 #[cfg(not(debug_assertions))]
-fn inject_fault(_stage: &str, _on_gpu: bool) {}
+fn inject_fault(_stage: &str, _on_gpu: bool) -> bool {
+    false
+}
 
 /// Logs go to stderr as `\x01LEVEL\ttarget\tmessage` lines; the parent
 /// re-logs them at the same level.

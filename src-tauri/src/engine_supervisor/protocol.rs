@@ -84,6 +84,8 @@ pub enum Response {
         language: Option<String>,
     },
     Ok,
+    /// transcribe.cpp ran out of memory; the worker is fine.
+    OutOfMemory(String),
     Error(String),
 }
 

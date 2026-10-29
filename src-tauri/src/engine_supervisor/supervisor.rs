@@ -571,6 +571,8 @@ enum Failure {
     Spawn(io::Error),
     /// transcribe.cpp returned an error; the worker is fine.
     Remote(String),
+    /// transcribe.cpp ran out of memory; the worker is fine.
+    OutOfMemory(String),
     /// The worker exited or crashed. Carries exit status and its last
     /// native output.
     Crashed(String),
@@ -590,7 +592,7 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failure::Spawn(e) => write!(f, "failed to start transcription worker: {e}"),
-            Failure::Remote(message) => f.write_str(message),
+            Failure::Remote(message) | Failure::OutOfMemory(message) => f.write_str(message),
             Failure::Crashed(detail) => write!(f, "transcription worker crashed ({detail})"),
             Failure::Hung(t) => write!(f, "transcription worker did not respond within {t:?}"),
             Failure::Cancelled => f.write_str("cancelled"),
@@ -822,14 +824,17 @@ impl Owner {
         }
     }
 
-    /// Deadlines for the device the current worker's model runs on.
-    fn deadlines(&self) -> Deadlines {
-        let on_gpu = self
-            .worker
+    /// Whether the current worker's model runs on a GPU.
+    fn on_gpu(&self) -> bool {
+        self.worker
             .as_ref()
             .and_then(|worker| worker.info.as_ref())
-            .is_some_and(|info| info.on_gpu);
-        Deadlines::for_device(on_gpu)
+            .is_some_and(|info| info.on_gpu)
+    }
+
+    /// Deadlines for the device the current worker's model runs on.
+    fn deadlines(&self) -> Deadlines {
+        Deadlines::for_device(self.on_gpu())
     }
 
     /// A call that [`EngineSupervisor::cancel`] can stop. Returns
@@ -878,6 +883,8 @@ impl Owner {
 
     /// Retry once after a crash or hang, on CPU if it happened on the GPU.
     /// Not after a hang on CPU, and never for an explicitly chosen device.
+    /// Out of GPU memory, which another app may hold only for a while, try
+    /// the GPU once more, then run just this audio on CPU.
     fn transcribe(
         &mut self,
         pcm: &[f32],
@@ -890,6 +897,7 @@ impl Owner {
             options: run.clone(),
         };
         let mut retried = false;
+        let mut out_of_memory = false;
         loop {
             if self.shared.cancelled_since(epoch) {
                 return Err(EngineError::Cancelled);
@@ -901,6 +909,16 @@ impl Owner {
             match self.call_work(&request, Some(pcm), deadline, epoch) {
                 Ok(Response::Transcript(transcript)) => return Ok(transcript),
                 Ok(other) => return Err(unexpected(&other).into()),
+                Err(Failure::OutOfMemory(message))
+                    if self.on_gpu() && !self.spec.as_ref().is_some_and(LoadSpec::pinned) =>
+                {
+                    if out_of_memory {
+                        warn!("Out of GPU memory again ({message}); transcribing on CPU");
+                        return self.transcribe_on_cpu(&request, pcm, epoch);
+                    }
+                    warn!("Out of GPU memory ({message}); trying the GPU again");
+                    out_of_memory = true;
+                }
                 Err(failure) if failure.worker_lost() => {
                     let on_gpu = self.worker_lost("transcription", &failure);
                     let pinned = self.spec.as_ref().is_some_and(LoadSpec::pinned);
@@ -913,6 +931,29 @@ impl Owner {
                 }
                 Err(failure) => return Err(failure.into()),
             }
+        }
+    }
+
+    /// Run `request` alone in a CPU-only worker. The GPU worker is stopped
+    /// first, freeing its memory, and the CPU one after, so the next run
+    /// starts fresh on the GPU: running out of memory doesn't mark it
+    /// unavailable.
+    fn transcribe_on_cpu(
+        &mut self,
+        request: &Request,
+        pcm: &[f32],
+        epoch: u64,
+    ) -> Result<Transcript, EngineError> {
+        let spec = self.spec.as_ref().ok_or_else(not_loaded)?.cpu();
+        self.worker = None;
+        let (worker, _) = self.start_worker(&spec)?;
+        self.worker = Some(worker);
+        let deadline = self.deadlines().run(pcm.len());
+        let result = self.call_work(request, Some(pcm), deadline, epoch);
+        self.worker = None;
+        match result? {
+            Response::Transcript(transcript) => Ok(transcript),
+            other => Err(unexpected(&other).into()),
         }
     }
 
@@ -1245,6 +1286,7 @@ impl Worker {
     fn wait(&mut self, request: &Request, deadline: Duration) -> Result<Response, Failure> {
         match self.responses.recv_timeout(deadline) {
             Ok(Response::Error(message)) => Err(Failure::Remote(message)),
+            Ok(Response::OutOfMemory(message)) => Err(Failure::OutOfMemory(message)),
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.control.kill();
@@ -1805,6 +1847,43 @@ mod tests {
             "loads stay on CPU while the GPU is marked unavailable"
         );
         engine.transcribe(pcm, RunOptions::default()).unwrap();
+        set_fault(None, false);
+    }
+
+    /// Out of memory on the GPU: one more try there, then the run alone on
+    /// CPU. The GPU isn't marked unavailable, so the next run is back on it.
+    #[test]
+    #[ignore]
+    fn gpu_out_of_memory_retries_then_runs_on_cpu() {
+        let pcm = test_pcm();
+        set_fault(Some("oom@run"), true);
+        let engine = EngineSupervisor::new(true);
+        let info = engine.load(spec()).unwrap();
+        assert!(info.on_gpu, "needs a GPU to test GPU-only faults");
+        let transcript = engine
+            .transcribe(pcm.clone(), RunOptions::default())
+            .unwrap();
+        println!("transcribed on CPU: {}", transcript.text);
+        assert!(!engine.shared.gpu_unavailable());
+        assert_eq!(worker_count(), 0, "the CPU worker stops after its run");
+        set_fault(None, false);
+        engine.transcribe(pcm, RunOptions::default()).unwrap();
+        assert!(engine.loaded().unwrap().on_gpu);
+        assert_eq!(worker_count(), 1);
+    }
+
+    /// Out of GPU memory once: the second try on the GPU succeeds.
+    #[test]
+    #[ignore]
+    fn gpu_out_of_memory_once_is_retried_on_the_gpu() {
+        set_fault(Some("oom@run"), false);
+        let engine = EngineSupervisor::new(true);
+        let info = engine.load(spec()).unwrap();
+        assert!(info.on_gpu, "needs a GPU to test GPU-only faults");
+        engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap();
+        assert_eq!(worker_count(), 1);
         set_fault(None, false);
     }
 
