@@ -329,7 +329,7 @@ fn load(
 /// Debug-build fault injection for exercising crash/hang recovery:
 /// `HANDY_WORKER_FAULT=<abort|segv|hang|oom>@<init|list|load|run|feed|finalize>`
 /// (`abort` is what `GGML_ASSERT` ends in, `segv` a real invalid memory write,
-/// `oom` a run that runs out of memory: true is returned and only a run uses it)
+/// `oom` makes a run report that transcribe.cpp ran out of memory)
 /// (`init` is backend registration, before the hello). With `HANDY_WORKER_FAULT_ONCE=<marker
 /// path>` it fires only in the first worker to reach that stage (the marker
 /// file records that it fired). With `HANDY_WORKER_FAULT_GPU_ONLY=1` it fires
